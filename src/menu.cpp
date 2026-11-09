@@ -406,6 +406,112 @@ void PrettyBuildName(char* out, size_t n, const char* name) {
 }
 
 // =============================================================================================
+// Quick tab: a host-owned page for save slots, favourite ships and one-click actions.
+// It uses only menu.h's helpers and sco::ui::Dispatch, so it needs no plugin DLL, no SDK tab
+// registration and no extra ImGui ABI coupling. To remove it, delete this block and the
+// "Quick" BeginTabItem in DrawMenu().
+// =============================================================================================
+
+void MenuClose();   // defined below in this file
+
+static char g_quickReply[512] = "尚未执行任何操作。";
+static char g_shipFilter[64] = "";
+static char g_consoleCmd[256] = "";
+
+static const char* const kQuickShips[] = {
+    "DRAK_Cutlass_Black", "RSI_Polaris", "AEGS_Gladius",
+    "ANVL_Hornet_F7C_Mk2", "MISC_Freelancer", "RSI_Constellation_Andromeda",
+};
+
+// Runs a bound chord and keeps its reply on the page. The four ctrl+alt+* chords are bound by
+// the save_slots Lua plugin; f6/f7/f8 belong to the built-ins.
+static void QuickChord(const char* chord, const char* what) {
+    for (const sco::ui::HotkeyInfo& h : sco::ui::Hotkeys()) {
+        if (h.chord != chord) continue;
+        std::string reply;
+        const sco::Result r = sco::ui::Dispatch(chord, &reply);
+        snprintf(g_quickReply, sizeof(g_quickReply), "%s：%s%s%s", what, sco::ResultName(r),
+                 reply.empty() ? "" : " · ", reply.c_str());
+        return;
+    }
+    snprintf(g_quickReply, sizeof(g_quickReply), "%s：%s 未绑定，请确认存档插件已启用并重启游戏。", what, chord);
+}
+
+static int QuickFindShip(const char* name) {
+    const MenuShip* ships = Menu_Ships();
+    for (int i = 0, n = Menu_ShipCount(); i < n; ++i)
+        if (_stricmp(ships[i].name, name) == 0) return i;
+    return -1;
+}
+
+static void QuickSpawn(int index) {
+    if (index < 0 || index >= Menu_ShipCount()) return;
+    MenuSpawnOptions opt;   // 20 m up, pilot seat, power on
+    Menu_RequestSpawn(index, opt);
+    snprintf(g_quickReply, sizeof(g_quickReply), "正在生成 %s……", Menu_Ships()[index].name);
+    MenuClose();
+}
+
+static void DrawQuickTab() {
+    const float w = Columns(2);
+
+    SectionHeading("存档");
+    if (ImGui::Button("保存档位 (Ctrl+Alt+S)", ImVec2(w, 0))) QuickChord("ctrl+alt+s", "存档");
+    ImGui::SameLine();
+    if (ImGui::Button("读取档位 (Ctrl+Alt+L)", ImVec2(w, 0))) QuickChord("ctrl+alt+l", "读档");
+    if (ImGui::Button("刷新状态 (Ctrl+Alt+I)", ImVec2(w, 0))) QuickChord("ctrl+alt+i", "状态");
+    ImGui::SameLine();
+    if (ImGui::Button("取消指令 (Ctrl+Alt+X)", ImVec2(w, 0))) QuickChord("ctrl+alt+x", "取消");
+    Hint("存档与读档由启动脚本在游戏退出后、下次启动前执行；请用 start-offline.bat 启动。");
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, Hex(0x0B140D, 0.92f));
+    ImGui::BeginChild("##quickreply", ImVec2(0, 56), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
+    ImGui::TextWrapped("%s", g_quickReply);
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+    SectionHeading("常用飞船 / 机型变体");
+    for (const char* name : kQuickShips) {
+        const int idx = QuickFindShip(name);
+        if (idx < 0) continue;
+        if (ImGui::Button(name, ImVec2(-1, 0))) QuickSpawn(idx);
+    }
+    SearchBox("##quickship", "搜索机型或变体，例如 Gladius / Cutlass / Polaris", g_shipFilter, sizeof(g_shipFilter));
+    if (g_shipFilter[0]) {
+        int shown = 0;
+        const MenuShip* ships = Menu_Ships();
+        for (int i = 0, n = Menu_ShipCount(); i < n && shown < 12; ++i) {
+            if (!MatchesFilter(ships[i].name, g_shipFilter)) continue;
+            ImGui::PushID(i);
+            if (ImGui::Button(ships[i].name, ImVec2(-1, 0))) QuickSpawn(i);
+            ImGui::PopID();
+            ++shown;
+        }
+        if (shown == 0) Hint("没有匹配的机型。");
+    } else {
+        Hint("输入关键词可列出同系列的全部机型与特殊变体，点一下即可生成并进入驾驶座。");
+    }
+    Hint("离线版不支持更换武器、组件或涂装等部件级改装；这里可切换机型/变体与飞船状态。");
+    if (ImGui::Button("开启 / 关闭电源（飞行准备）", ImVec2(-1, 0))) Menu_RequestFlightReady();
+
+    SectionHeading("常用操作");
+    if (ImGui::Button("建造 F6", ImVec2(w, 0))) QuickChord("f6", "建造");
+    ImGui::SameLine();
+    if (ImGui::Button("存点 F7", ImVec2(w, 0))) QuickChord("f7", "存点");
+    if (ImGui::Button("回点 F8", ImVec2(w, 0))) QuickChord("f8", "回点");
+    ImGui::SameLine();
+    if (ImGui::Button("撤销建造", ImVec2(w, 0))) Menu_BuildUndo();
+    if (ImGui::Button("清空建造物", ImVec2(-1, 0))) Menu_BuildClear();
+
+    SectionHeading("控制台命令");
+    SearchBox("##quickconsole", "输入游戏控制台命令", g_consoleCmd, sizeof(g_consoleCmd));
+    if (ImGui::Button("执行", ImVec2(-1, 0)) && g_consoleCmd[0]) {
+        if (Menu_ConsoleReady()) Menu_RunConsole(g_consoleCmd);
+        else snprintf(g_quickReply, sizeof(g_quickReply), "游戏控制台尚未就绪。");
+    }
+    Hint("输出写入 Game.log，不显示在菜单中。可用于试验改装相关的 cvar / 指令。");
+}
+
+// =============================================================================================
 // Menu settings
 // =============================================================================================
 
@@ -508,6 +614,7 @@ static bool DrawMenu() {
             first = false;
             if (ImGui::BeginTabItem(label.c_str(), nullptr, flags)) { body([&] { DrawPluginTab(t, frame); }); ImGui::EndTabItem(); }
         }
+        if (ImGui::BeginTabItem("快捷###sco.quick", nullptr, 0)) { body([&] { DrawQuickTab(); }); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("菜单", nullptr, first ? ImGuiTabItemFlags_SetSelected : 0)) { body([&] { DrawMenuTab(); }); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
